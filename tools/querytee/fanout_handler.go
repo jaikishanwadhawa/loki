@@ -366,6 +366,12 @@ func (h *FanOutHandler) recordMetrics(result *backendResult, method, issuer stri
 // processGoldfishComparison processes responses for goldfish comparison.
 func (h *FanOutHandler) processGoldfishComparison(httpReq *http.Request, preferredResult *backendResult, results []*backendResult) {
 	if h.goldfishManager == nil || len(results) < 2 || preferredResult == nil {
+		level.Warn(h.logger).Log(
+			"msg", "unable to process query with Goldfish",
+			"num_responses", len(results),
+			"have_preferred_result", preferredResult != nil,
+			"has_goldfish_manager", h.goldfishManager != nil,
+		)
 		return
 	}
 	tenantID, _, _ := tenant.ExtractTenantIDFromHTTPRequest(httpReq)
