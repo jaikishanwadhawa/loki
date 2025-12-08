@@ -12,6 +12,8 @@ import (
 
 // CompareResponses compares performance statistics and hashes from QuerySample
 func CompareResponses(sample *goldfish.QuerySample, cellAResp, cellBResp *ResponseData, performanceTolerance float64, comparator comparator.ResponsesComparator, logger logger.Logger) goldfish.ComparisonResult {
+	level.Debug(logger).Log("msg", "stats before comparison", "cell_a", sample.CellAStats, "cell_b", sample.CellBStats)
+
 	result := goldfish.ComparisonResult{
 		CorrelationID:     sample.CorrelationID,
 		DifferenceDetails: make(map[string]any),

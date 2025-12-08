@@ -129,7 +129,7 @@ func (m *Manager) SendToGoldfish(httpReq *http.Request, cellAResp, cellBResp *Ba
 	cellAData, err := CaptureResponse(&http.Response{
 		StatusCode: cellAResp.Status,
 		Body:       io.NopCloser(bytes.NewReader(cellAResp.Body)),
-	}, cellAResp.Duration, cellAResp.TraceID, cellAResp.SpanID)
+	}, cellAResp.Duration, cellAResp.TraceID, cellAResp.SpanID, m.logger)
 	if err != nil {
 		level.Error(m.logger).Log("msg", "failed to capture cell A response", "err", err)
 		return
@@ -139,7 +139,7 @@ func (m *Manager) SendToGoldfish(httpReq *http.Request, cellAResp, cellBResp *Ba
 	cellBData, err := CaptureResponse(&http.Response{
 		StatusCode: cellBResp.Status,
 		Body:       io.NopCloser(bytes.NewReader(cellBResp.Body)),
-	}, cellBResp.Duration, cellBResp.TraceID, cellBResp.SpanID)
+	}, cellBResp.Duration, cellBResp.TraceID, cellBResp.SpanID, m.logger)
 	if err != nil {
 		level.Error(m.logger).Log("msg", "failed to capture cell B response", "err", err)
 		return
@@ -426,7 +426,7 @@ type ResponseData struct {
 }
 
 // CaptureResponse captures response data for comparison including trace ID and span ID
-func CaptureResponse(resp *http.Response, duration time.Duration, traceID, spanID string) (*ResponseData, error) {
+func CaptureResponse(resp *http.Response, duration time.Duration, traceID, spanID string, logger log.Logger) (*ResponseData, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -443,10 +443,10 @@ func CaptureResponse(resp *http.Response, duration time.Duration, traceID, spanI
 
 	if resp.StatusCode == 200 {
 		extractor := NewStatsExtractor()
-		stats, hash, size, usedNewEngine, err = extractor.ExtractResponseData(body, duration.Milliseconds())
+		stats, hash, size, usedNewEngine, err = extractor.ExtractResponseData(body, duration.Milliseconds(), logger)
 		if err != nil {
 			// Log error but don't fail the capture
-			level.Warn(log.NewNopLogger()).Log("msg", "failed to extract response statistics", "err", err)
+			level.Warn(logger).Log("msg", "failed to extract response statistics", "err", err)
 		}
 	} else {
 		size = int64(len(body))

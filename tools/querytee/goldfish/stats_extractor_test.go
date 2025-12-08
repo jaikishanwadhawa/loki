@@ -3,6 +3,7 @@ package goldfish
 import (
 	"testing"
 
+	"github.com/go-kit/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -184,7 +185,7 @@ func TestStatsExtractor_NewEngineWarningDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stats, hash, size, usedNewEngine, err := extractor.ExtractResponseData([]byte(tt.responseBody), 50)
+			stats, hash, size, usedNewEngine, err := extractor.ExtractResponseData([]byte(tt.responseBody), 50, log.NewNopLogger())
 
 			if tt.expectedError {
 				assert.Error(t, err)

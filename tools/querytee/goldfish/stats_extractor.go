@@ -6,6 +6,8 @@ import (
 	"hash/fnv"
 	"strconv"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/grafana/loki/v3/pkg/goldfish"
 	"github.com/grafana/loki/v3/pkg/loghttp"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
@@ -25,14 +27,14 @@ func NewStatsExtractor() *StatsExtractor {
 // ExtractResponseData extracts performance statistics and metadata from a Loki response.
 // Returns QueryStats, content hash (FNV32), response size, whether new engine was used, and any parsing errors.
 // The content hash excludes performance statistics to ensure identical content produces identical hashes.
-func (e *StatsExtractor) ExtractResponseData(responseBody []byte, duration int64) (goldfish.QueryStats, string, int64, bool, error) {
+func (e *StatsExtractor) ExtractResponseData(responseBody []byte, duration int64, logger log.Logger) (goldfish.QueryStats, string, int64, bool, error) {
 	var queryResp loghttp.QueryResponse
 	if err := json.Unmarshal(responseBody, &queryResp); err != nil {
 		return goldfish.QueryStats{}, "", 0, false, fmt.Errorf("failed to parse query response: %w", err)
 	}
 
 	// Extract statistics from the response
-	queryStats := e.extractQueryStats(queryResp.Data.Statistics, duration)
+	queryStats := e.extractQueryStats(queryResp.Data.Statistics, duration, logger)
 
 	// Generate response hash for integrity checking (without storing sensitive data)
 	responseHash := e.generateResponseHash(queryResp)
@@ -47,7 +49,9 @@ func (e *StatsExtractor) ExtractResponseData(responseBody []byte, duration int64
 }
 
 // extractQueryStats converts stats.Result to our QueryStats format
-func (e *StatsExtractor) extractQueryStats(statsResult stats.Result, _ int64) goldfish.QueryStats {
+func (e *StatsExtractor) extractQueryStats(statsResult stats.Result, _ int64, logger log.Logger) goldfish.QueryStats {
+	level.Debug(logger).Log("msg", "stats summary before extraction", "stats", statsResult.Summary)
+
 	return goldfish.QueryStats{
 		ExecTimeMs:           int64(statsResult.Summary.ExecTime * 1000),  // Convert seconds to milliseconds
 		QueueTimeMs:          int64(statsResult.Summary.QueueTime * 1000), // Convert seconds to milliseconds
