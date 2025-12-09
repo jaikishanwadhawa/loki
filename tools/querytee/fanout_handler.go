@@ -108,6 +108,15 @@ func (h *FanOutHandler) Do(ctx context.Context, req queryrangebase.Request) (que
 		return nil, fmt.Errorf("failed to extract tenant IDs: %w", err)
 	}
 	shouldSample := false
+
+	if h.goldfishManager == nil || len(tenants) == 0 {
+		level.Warn(h.logger).Log(
+			"msg", "unable to process query with Goldfish",
+			"has_goldfish_manager", h.goldfishManager != nil,
+			"num_tenants", len(tenants),
+		)
+	}
+
 	if h.goldfishManager != nil {
 		for _, tenant := range tenants {
 			if h.goldfishManager.ShouldSample(tenant) {

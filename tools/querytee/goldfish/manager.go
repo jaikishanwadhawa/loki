@@ -52,6 +52,7 @@ type metrics struct {
 // Returns an error if the configuration is invalid.
 func NewManager(config Config, comparator comparator.ResponsesComparator, storage goldfish.Storage, resultStore ResultStore, logger log.Logger, registerer prometheus.Registerer) (*Manager, error) {
 	if err := config.Validate(); err != nil {
+		level.Warn(logger).Log("msg", "invalid config trying to create goldfish manager", "error", err)
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 

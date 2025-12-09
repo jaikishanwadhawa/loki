@@ -222,6 +222,13 @@ func (p *ProxyEndpoint) serveWrites(w http.ResponseWriter, r *http.Request) {
 
 	// Determine if we should sample this query
 	shouldSample := false
+	if p.goldfishManager == nil || tenantID == "" {
+		level.Warn(p.logger).Log(
+			"msg", "unable to process query with Goldfish",
+			"has_goldfish_manager", p.goldfishManager != nil,
+			"extracted_tenant", len(tenantID),
+		)
+	}
 	if p.goldfishManager != nil {
 		shouldSample = p.goldfishManager.ShouldSample(tenantID)
 		level.Debug(p.logger).Log(
