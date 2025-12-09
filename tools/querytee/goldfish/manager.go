@@ -371,15 +371,24 @@ func (m *Manager) persistResultPayloads(ctx context.Context, sample *goldfish.Qu
 
 func (m *Manager) shouldPersistResults(result goldfish.ComparisonResult) bool {
 	if m.resultStore == nil {
+		level.Warn(m.logger).Log("msg", "result store is nil, not persisting results", "fn_caller", "shouldPersistResults")
 		return false
 	}
 
 	switch m.config.ResultsStorage.Mode {
 	case ResultsPersistenceModeAll:
+		level.Info(m.logger).Log("msg", "persisting results, because persistence mode is all", "fn_caller", "shouldPersistResults")
 		return true
 	case ResultsPersistenceModeMismatchOnly:
-		return result.ComparisonStatus != goldfish.ComparisonStatusMatch
+		comparisonStatusMatch := result.ComparisonStatus != goldfish.ComparisonStatusMatch
+		if comparisonStatusMatch {
+			level.Info(m.logger).Log("msg", "persisting results, because comparison status is mismatch", "fn_caller", "shouldPersistResults")
+			return true
+		}
+		level.Info(m.logger).Log("msg", "not persisting results, because comparison status is match", "fn_caller", "shouldPersistResults")
+		return false
 	default:
+		level.Info(m.logger).Log("msg", "not persisting results, because we hit the default case", "fn_caller", "shouldPersistResults")
 		return false
 	}
 }

@@ -394,7 +394,7 @@ func (p *ProxyEndpoint) executeBackendRequests(r *http.Request, resCh chan *Back
 
 		if cellAResp != nil && cellBResp != nil {
 			tenantID, _, _ := tenant.ExtractTenantIDFromHTTPRequest(r)
-			level.Info(p.logger).Log("msg", "Processing query with Goldfish",
+			level.Info(p.logger).Log("msg", "processing query with Goldfish",
 				"tenant", tenantID,
 				"query", r.URL.Query().Get("query"),
 				"cellA_backend", cellAResp.backend.name,
