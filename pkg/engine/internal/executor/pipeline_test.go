@@ -32,7 +32,7 @@ func CSVToArrowWithAllocator(allocator memory.Allocator, fields []arrow.Field, c
 	// Create schema
 	schema := arrow.NewSchema(fields, nil)
 
-	// Set up CSV reader with stringified data
+	// Set up CSV currentReader with stringified data
 	input := strings.NewReader(csvData)
 	reader := csv.NewReader(
 		input,

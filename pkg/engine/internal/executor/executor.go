@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/pointers"
 	"github.com/thanos-io/objstore"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -95,6 +96,10 @@ func (c *Context) execute(ctx context.Context, node physical.Node) Pipeline {
 			return newObservedPipeline(c.executeDataObjScan(ctx, n, nodeRegion))
 		}, inputs)
 
+	case *physical.PointersScan:
+		return newLazyPipeline(func(ctx context.Context, _ []Pipeline) Pipeline {
+			return newObservedPipeline(c.executePointersScan(ctx, n, nodeRegion))
+		}, inputs)
 	case *physical.TopK:
 		return newObservedPipeline(c.executeTopK(ctx, n, inputs, nodeRegion))
 	case *physical.Limit:
@@ -204,6 +209,73 @@ func (c *Context) executeDataObjScan(ctx context.Context, node *physical.DataObj
 
 		BatchSize: c.batchSize,
 	}, log.With(c.logger, "location", string(node.Location), "section", node.Section), region)
+
+	return pipeline
+}
+
+func (c *Context) executePointersScan(ctx context.Context, node *physical.PointersScan, region *xcap.Region) Pipeline {
+	if c.bucket == nil {
+		return errorPipeline(ctx, errors.New("no object store bucket configured"))
+	}
+
+	obj, err := dataobj.FromBucket(ctx, c.bucket, string(node.Location))
+	if err != nil {
+		return errorPipeline(ctx, fmt.Errorf("creating data object: %w", err))
+	}
+	region.AddEvent("opened dataobj")
+
+	var (
+		streamsSection   *streams.Section
+		pointersSections []*pointers.Section
+	)
+
+	tenant, err := user.ExtractOrgID(ctx)
+	if err != nil {
+		return errorPipeline(ctx, fmt.Errorf("missing org ID: %w", err))
+	}
+
+	for _, sec := range obj.Sections().Filter(streams.CheckSection) {
+		if sec.Tenant != tenant {
+			continue
+		}
+
+		if streamsSection != nil {
+			return errorPipeline(ctx, fmt.Errorf("multiple streams sections found in data object %q", node.Location))
+		}
+
+		var err error
+		streamsSection, err = streams.Open(ctx, sec)
+		if err != nil {
+			return errorPipeline(ctx, fmt.Errorf("opening streams section %q: %w", sec.Type, err))
+		}
+		region.AddEvent("opened streams section")
+	}
+	if streamsSection == nil {
+		return errorPipeline(ctx, fmt.Errorf("streams section not found in data object %q", node.Location))
+	}
+
+	for _, sec := range obj.Sections().Filter(pointers.CheckSection) {
+		if sec.Tenant != tenant {
+			continue
+		}
+
+		s, err := pointers.Open(ctx, sec)
+		if err != nil {
+			return errorPipeline(ctx, fmt.Errorf("pointers logs section %q: %w", sec.Type, err))
+		}
+		pointersSections = append(pointersSections, s)
+		region.AddEvent("opened pointers section")
+		break
+	}
+
+	var pipeline Pipeline = newPointersScanPipeline(pointersScanOptions{
+		StreamsSection:   streamsSection,
+		PointersSections: pointersSections,
+		Selector:         node.Selector,
+		BatchSize:        c.batchSize,
+		Start:            node.Start,
+		End:              node.End,
+	}, log.With(c.logger, "location", string(node.Location)), region)
 
 	return pipeline
 }
@@ -336,7 +408,7 @@ func (c *Context) executeScanSet(ctx context.Context, set *physical.ScanSet, _ *
 	// ScanSet typically gets partitioned by the scheduler into multiple scan
 	// nodes.
 	//
-	// However, for locally testing unpartitioned pipelines, we still supprt
+	// However, for locally testing unpartitioned pipelines, we still support
 	// running a ScanSet. In this case, we treat internally execute it as a
 	// Merge on top of multiple sequential scans.
 	ctx, mergeRegion := xcap.StartRegion(ctx, physical.NodeTypeMerge.String())
@@ -355,6 +427,16 @@ func (c *Context) executeScanSet(ctx context.Context, set *physical.ScanSet, _ *
 
 			targets = append(targets, newLazyPipeline(func(_ context.Context, _ []Pipeline) Pipeline {
 				return newObservedPipeline(c.executeDataObjScan(nodeCtx, partition, partitionRegion))
+			}, nil))
+		case physical.ScanTypePointers:
+			// Make sure projections and predicates get passed down to the
+			// individual scan.
+			partition := target.PointersScan
+
+			nodeCtx, partitionRegion := startRegionForNode(ctx, partition)
+
+			targets = append(targets, newLazyPipeline(func(_ context.Context, _ []Pipeline) Pipeline {
+				return newObservedPipeline(c.executePointersScan(nodeCtx, partition, partitionRegion))
 			}, nil))
 		default:
 			return errorPipeline(ctx, fmt.Errorf("unrecognized ScanSet target %s", target.Type))
@@ -452,6 +534,10 @@ func startRegionForNode(ctx context.Context, n physical.Node) (context.Context, 
 			attribute.Int("num_predicates", len(n.Predicates)),
 			attribute.Int("num_projections", len(n.Projections)),
 		)
+
+	case *physical.PointersScan:
+		attributes = append(attributes,
+			attribute.String("location", string(n.Location)))
 	default:
 		// do nothing.
 	}

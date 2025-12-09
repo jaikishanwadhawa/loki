@@ -11,6 +11,8 @@ type Metastore interface {
 	// Sections returns a list of SectionDescriptors, including metadata (stream IDs, start & end times, bytes), for the given matchers & predicates between [start,end]
 	Sections(ctx context.Context, start, end time.Time, matchers []*labels.Matcher, predicates []*labels.Matcher) ([]*DataobjSectionDescriptor, error)
 
+	GetIndexes(ctx context.Context, start, end time.Time) ([]string, error)
+
 	// Labels returns all possible labels from matching streams between [start,end]
 	Labels(ctx context.Context, start, end time.Time, matchers ...*labels.Matcher) ([]string, error) // Used to get possible labels for a given stream
 

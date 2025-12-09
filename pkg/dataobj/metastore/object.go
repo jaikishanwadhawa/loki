@@ -723,3 +723,33 @@ func dedupeAndSort(objects [][]string) []string {
 	sort.Strings(paths)
 	return paths
 }
+
+func (m *ObjectMetastore) GetIndexes(ctx context.Context, start, end time.Time) ([]string, error) {
+	ctx, region := xcap.StartRegion(ctx, "ObjectMetastore.GetIndexes")
+	defer region.End()
+
+	// Get all metastore paths for the time range
+	var tablePaths []string
+	for path := range iterTableOfContentsPaths(start, end) {
+		tablePaths = append(tablePaths, path)
+	}
+
+	// Return early if no toc files are found
+	if len(tablePaths) == 0 {
+		m.metrics.indexObjectsTotal.Observe(0)
+		m.metrics.resolvedSectionsTotal.Observe(0)
+		level.Debug(utillog.WithContext(ctx, m.logger)).Log("msg", "no sections resolved", "reason", "no toc paths")
+		return nil, nil
+	}
+
+	// List index objects from all tables concurrently
+	indexPaths, err := m.listObjectsFromTables(ctx, tablePaths, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	m.metrics.indexObjectsTotal.Observe(float64(len(indexPaths)))
+	region.Record(xcap.StatMetastoreIndexObjects.Observe(int64(len(indexPaths))))
+
+	return indexPaths, nil
+}

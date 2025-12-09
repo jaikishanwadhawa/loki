@@ -10,9 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/pointers"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/objstore"
 	"go.opentelemetry.io/otel"
@@ -58,12 +61,16 @@ type ExecutorConfig struct {
 
 	// RangeConfig determines how to optimize range reads in the V2 engine.
 	RangeConfig rangeio.Config `yaml:"range_reads" category:"experimental" doc:"description=Configures how to read byte ranges from object storage when using the V2 engine."`
+
+	// MetaqueriesEnabled toggles the metaquery planning stage.
+	MetaqueriesEnabled bool `yaml:"metaqueries_enabled" category:"experimental"`
 }
 
 func (cfg *ExecutorConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.IntVar(&cfg.BatchSize, prefix+"batch-size", 100, "Experimental: Batch size of the next generation query engine.")
 	f.IntVar(&cfg.MergePrefetchCount, prefix+"merge-prefetch-count", 0, "Experimental: The number of inputs that are prefetched simultaneously by any Merge node. A value of 0 means that only the currently processed input is prefetched, 1 means that only the next input is prefetched, and so on. A negative value means that all inputs are be prefetched in parallel.")
 	cfg.RangeConfig.RegisterFlags(prefix+"range-reads.", f)
+	f.BoolVar(&cfg.MetaqueriesEnabled, prefix+"metaquery-enable", false, "Experimental: Enable the metaquery planning stage that precomputes catalog lookups.")
 }
 
 // Params holds parameters for constructing a new [Engine].
@@ -107,6 +114,8 @@ type Engine struct {
 	limits    logql.Limits    // Limits to apply to engine queries.
 
 	metastore metastore.Metastore
+	// metaqueriesEnabled gates the metaquery planning stage.
+	metaqueriesEnabled bool
 }
 
 // New creates a new Engine.
@@ -120,9 +129,10 @@ func New(params Params) (*Engine, error) {
 		metrics:     newMetrics(params.Registerer),
 		rangeConfig: params.Config.RangeConfig,
 
-		scheduler: params.Scheduler,
-		bucket:    bucket.NewXCapBucket(params.Bucket),
-		limits:    params.Limits,
+		scheduler:          params.Scheduler,
+		bucket:             bucket.NewXCapBucket(params.Bucket),
+		limits:             params.Limits,
+		metaqueriesEnabled: params.Config.MetaqueriesEnabled,
 	}
 
 	if e.bucket != nil {
@@ -305,9 +315,31 @@ func (e *Engine) buildPhysicalPlan(ctx context.Context, logger log.Logger, param
 	region := xcap.RegionFromContext(ctx)
 	timer := prometheus.NewTimer(e.metrics.physicalPlanning)
 
-	// TODO(rfratto): To improve the performance of the physical planner, we
-	// may want to parallelize metastore lookups across scheduled tasks as well.
-	catalog := physical.NewMetastoreCatalog(ctx, e.metastore)
+	var (
+		catalog      physical.Catalog
+		metaDuration time.Duration
+		metaRequests int
+	)
+	if e.metaqueriesEnabled {
+		// run all the metastore lookups at this point and prepare a metastore catalog that already has all the answers
+		var err error
+		catalog, metaDuration, metaRequests, err = e.prepareCatalogWithMetaqueries(ctx, params, logicalPlan)
+		if err != nil {
+			level.Warn(logger).Log("msg", "failed to prepare metaqueries", "err", err)
+			region.RecordError(err)
+			return nil, 0, ErrPlanningFailed
+		}
+		e.metrics.metaqueryPlanning.Observe(metaDuration.Seconds())
+		level.Info(logger).Log("msg", "finished metaquery planning", "duration", metaDuration.String(), "requests", metaRequests)
+		region.AddEvent("finished metaquery planning",
+			attribute.Stringer("duration", metaDuration),
+			attribute.Int("requests", metaRequests),
+		)
+	} else {
+		// TODO(rfratto): To improve the performance of the physical planner, we
+		// may want to parallelize metastore lookups across scheduled tasks as well.
+		catalog = physical.NewMetastoreCatalog(ctx, e.metastore)
+	}
 
 	// TODO(rfratto): It feels strange that we need to past the start/end time
 	// to the physical planner. Isn't it already represented by the logical
@@ -339,6 +371,171 @@ func (e *Engine) buildPhysicalPlan(ctx context.Context, logger log.Logger, param
 		attribute.Stringer("duration", duration),
 	)
 	return physicalPlan, duration, nil
+}
+
+func (e *Engine) prepareCatalogWithMetaqueries(ctx context.Context, params logql.Params, logicalPlan *logical.Plan) (physical.Catalog, time.Duration, int, error) {
+	start := time.Now()
+
+	collector := physical.NewMetastoreCollectorCatalog()
+	collectorPlanner := physical.NewPlanner(physical.NewContext(params.Start(), params.End()), collector)
+	if _, err := collectorPlanner.Build(logicalPlan); err != nil {
+		return nil, 0, 0, err
+	}
+
+	requests := collector.Requests()
+
+	prepared := physical.NewMetaqueryPreparedCatalog()
+	for _, req := range requests {
+		result, err := e.queryMetastore(ctx, req)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+
+		if err := prepared.Store(req, result); err != nil {
+			return nil, 0, 0, fmt.Errorf("storing metaquery result: %w", err)
+		}
+	}
+
+	return prepared, time.Since(start), len(requests), nil
+}
+
+func (e *Engine) queryMetastore(ctx context.Context, req physical.MetastoreRequest) (physical.MetastoreResponse, error) {
+	physicalPlan, err := physical.PlanForMetastoreRequest(ctx, req, e.metastore)
+	if err != nil {
+		return physical.MetastoreResponse{}, fmt.Errorf("planning metastore request: %w", err)
+	}
+
+	wf, _, err := e.buildWorkflow(ctx, e.logger, physicalPlan)
+	if err != nil {
+		return physical.MetastoreResponse{}, fmt.Errorf("building workflow: %w", err)
+	}
+
+	pipeline, err := wf.Run(ctx)
+	if err != nil {
+		return physical.MetastoreResponse{}, fmt.Errorf("running workflow: %w", err)
+	}
+
+	// TODO(ivkalita): use ResultBuilder here?
+	// TODO(ivkalita): switch on request type?
+	result := physical.MetastoreResponse{Kind: physical.MetastoreRequestKindSections}
+
+	objectSectionDescriptors := make(map[metastore.SectionKey]*metastore.DataobjSectionDescriptor)
+	for {
+		rec, err := pipeline.Read(ctx)
+		if err != nil && !errors.Is(err, executor.EOF) {
+			level.Warn(e.logger).Log(
+				"msg", "error during execution",
+				"err", err,
+			)
+			return physical.MetastoreResponse{}, err
+		}
+
+		if rec != nil && rec.NumRows() > 0 {
+			if err := addSectionDescriptors(rec, objectSectionDescriptors); err != nil {
+				return physical.MetastoreResponse{}, err
+			}
+		}
+
+		if errors.Is(err, executor.EOF) {
+			break
+		}
+	}
+
+	result.Sections = make([]*metastore.DataobjSectionDescriptor, 0, len(objectSectionDescriptors))
+	for _, s := range objectSectionDescriptors {
+		result.Sections = append(result.Sections, s)
+	}
+
+	return result, nil
+}
+
+func addSectionDescriptors(rec arrow.RecordBatch, result map[metastore.SectionKey]*metastore.DataobjSectionDescriptor) error {
+	numRows := int(rec.NumRows())
+	buf := make([]pointers.SectionPointer, numRows)
+	schema := rec.Schema()
+	for fIdx := range schema.Fields() {
+		field := schema.Field(fIdx)
+		col := rec.Column(fIdx)
+		switch field.Name {
+		case "path.path.utf8":
+			values := col.(*array.String)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].Path = values.Value(rIdx)
+			}
+		case "section.int64":
+			values := col.(*array.Int64)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].Section = values.Value(rIdx)
+			}
+		case "stream_id.int64":
+			values := col.(*array.Int64)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].StreamID = values.Value(rIdx)
+			}
+		case "stream_id_ref.int64":
+			values := col.(*array.Int64)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].StreamIDRef = values.Value(rIdx)
+			}
+		case "min_timestamp.timestamp":
+			values := col.(*array.Timestamp)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].StartTs = time.Unix(0, int64(values.Value(rIdx)))
+			}
+		case "max_timestamp.timestamp":
+			values := col.(*array.Timestamp)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].EndTs = time.Unix(0, int64(values.Value(rIdx)))
+			}
+		case "row_count.int64":
+			values := col.(*array.Int64)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].LineCount = values.Value(rIdx)
+			}
+		case "uncompressed_size.int64":
+			values := col.(*array.Int64)
+			for rIdx := range numRows {
+				if col.IsNull(rIdx) {
+					continue
+				}
+				buf[rIdx].UncompressedSize = values.Value(rIdx)
+			}
+		default:
+			continue
+		}
+	}
+
+	for _, ptr := range buf {
+		key := metastore.SectionKey{ObjectPath: ptr.Path, SectionIdx: ptr.Section}
+		existing, ok := result[key]
+		if !ok {
+			result[key] = metastore.NewSectionDescriptor(ptr)
+			continue
+		}
+		existing.Merge(ptr)
+	}
+	return nil
 }
 
 // buildWorkflow builds a workflow from the given physical plan.

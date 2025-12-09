@@ -173,6 +173,10 @@ func filterDescriptorsForShard(shard ShardInfo, sectionDescriptors []*metastore.
 	return filteredDescriptors, nil
 }
 
+func ExpressionToMatchers(selector Expression, allowAmbiguousColumnRefs bool) ([]*labels.Matcher, error) {
+	return expressionToMatchers(selector, allowAmbiguousColumnRefs)
+}
+
 // expressionToMatchers converts a selector expression to a list of matchers.
 // The selector expression is required to be a (tree of) [BinaryExpression]
 // with a [ColumnExpression] on the left and a [LiteralExpression] on the right.
